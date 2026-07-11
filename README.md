@@ -2,10 +2,6 @@
 
 An architecture and proof of concept for an AI assistant that listens to live support calls and gives agents useful, text-based guidance while the conversation is still happening.
 
-The project is built around one principle:
-
-> Use the smallest reliable model for each decision, and reserve expensive models for the few cases that genuinely need them.
-
 ## Contents
 
 - [System at a glance](#system-at-a-glance)
@@ -469,6 +465,25 @@ The following figures include approximately 30% headroom and must be replaced wi
 | Suggestion availability | 99.5% |
 
 The transcript has a higher priority than generation. Under saturation, the platform first reduces low-value suggestions, then restricts RAG or external escalation, while preserving the call and transcription whenever possible.
+
+### Performance and cost optimizations
+
+Beyond the architectural cost controls listed under [Economics](#economics), the serving layer applies several inference-level optimizations. Each keeps the same service boundaries and is validated against the latency and availability targets above.
+
+| Optimization | Where | Effect |
+|---|---|---|
+| **Prefix caching (KV reuse)** | vLLM live copilot | The domain prompt, policy, and running conversation state form a shared prefix across turns in one call. Reusing the cached KV blocks avoids re-prefilling on every turn and lowers time-to-first-token. |
+| **Speculative decoding** | vLLM live copilot | A small draft model proposes tokens that the target model verifies in parallel, improving throughput and TTFT for the p95 ≤1.5 s suggestion target without changing output quality. |
+| **FP8/INT8 quantization tiers** | Live 8B/14B on L40S-class GPUs | Serve routine live guidance quantized to raise GPU density and reduce the fast-inference fleet; reserve higher precision for escalation and post-call synthesis. |
+| **Micro-batched embeddings** | bge-m3 embedding service | Live RAG queries are grouped in a short time window before hitting the embedding server, mirroring the cross-call batching already used for STT. |
+| **Async RAG prefetch** | RAG orchestrator | Embedding and vector search begin while the router is still scoring risk, hiding retrieval latency behind classification. |
+| **Near-miss cache reuse** | Semantic cache in Redis | High-similarity cache hits return an approved answer directly or with a small local rewrite instead of a full generation, widening the cache-hit band for recurring requests. |
+| **Per-turn token budget caps** | LLM gateway | Suggestions are short by design, so a hard `max_tokens` per turn prevents runaway generation cost. |
+| **Request hedging for critical turns** | LLM gateway | High-risk turns can be sent to the local model and the paid provider together, taking the first valid response to trim tail latency where policy allows. |
+| **Adaptive escalation threshold** | Router | Paid-model routing thresholds auto-tune from measured local-model safety and accuracy per domain, shrinking the paid share as small models improve. |
+| **Feedback-driven router distillation** | `agent.feedback.v1` loop | Accepted/edited/rejected outcomes periodically retrain the router, reducing wrong escalations and unnecessary paid spend. |
+
+The highest-ROI, lowest-risk changes are prefix caching, speculative decoding, and FP8 quantization; all live in the existing vLLM serving layer and improve latency and cost together.
 
 ## Economics
 
