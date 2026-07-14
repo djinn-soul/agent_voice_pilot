@@ -211,16 +211,32 @@ flowchart LR
             STTG[STT stream gateway]:::cpu
             TURN[Turn finalizer and transcript assembler]:::cpu
             PII[PII redaction service]:::cpu
-            ROUTER[Intent, domain and risk router]:::cpu
+            ROUTER[Intent, domain, complexity and risk router]:::cpu
+            CACHE[Semantic and retrieval cache]:::cpu
             RAG[RAG orchestrator]:::cpu
             LLMGW[LLM gateway]:::cpu
             GUARD[Output policy guard]:::cpu
+            ESC[Human escalation and supervisor event]:::cpu
+            AUDIT[Audit and telemetry publisher]:::cpu
             SESSION --> STTG
-            TURN --> PII --> ROUTER
-            ROUTER -->|knowledge request| RAG
-            ROUTER -->|generation request| LLMGW
-            RAG --> LLMGW
-            LLMGW --> GUARD --> WS
+            STTG --> TURN
+            TURN --> PII
+            PII --> ROUTER
+            ROUTER -->|requires_rag=false<br/>general or procedural request| LLMGW
+            ROUTER -->|requires_rag=true<br/>cache_allowed=true| CACHE
+            CACHE -->|approved and fresh hit| LLMGW
+            CACHE -->|miss, stale or unsafe| RAG
+            ROUTER -->|requires_rag=true<br/>cache_allowed=false| RAG
+            RAG -->|grounded generation request<br/>context, citations, retrieval scores| LLMGW
+            ROUTER -->|human_required=true<br/>critical risk or explicit supervisor request| ESC
+            ESC --> SESSION
+            LLMGW --> GUARD
+            GUARD -->|approved suggestion| WS
+            GUARD -->|blocked or regeneration required| LLMGW
+            ROUTER --> AUDIT
+            RAG --> AUDIT
+            LLMGW --> AUDIT
+            GUARD --> AUDIT
         end
 
         subgraph GPU[gpu-inference namespace]
@@ -248,7 +264,7 @@ flowchart LR
         STTG <-->|bidirectional gRPC audio and partial text| STT
         STTG -->|partial and final transcript| TURN
         ROUTER -->|classification| NLP
-        ROUTER <-->|approved semantic cache| REDIS
+        CACHE <-->|approved semantic and retrieval cache| REDIS
         RAG -->|embed and rerank| NLP
         RAG <-->|vector search| QD
         RAG -->|document metadata and access policy| PG
@@ -257,7 +273,7 @@ flowchart LR
         SESSION <-->|ephemeral call state| REDIS
         SESSION -->|call and transcript events| KAFKA
         PII -->|redacted transcript events| KAFKA
-        GUARD -->|suggestion and audit events| KAFKA
+        AUDIT -->|routing, retrieval, generation and policy events| KAFKA
         KAFKA --> WRITER
         KAFKA --> POST
         KAFKA --> ANALYTICS
@@ -318,11 +334,12 @@ The live path uses direct streaming calls because putting audio frames or genera
 4. The session orchestrator assigns a regional session, stores short-lived state in Redis, and connects the stream to the STT gateway.
 5. The STT gateway batches audio across calls and streams it to a Triton-hosted speech model. Partial transcripts can be displayed immediately; only finalized turns continue to LLM routing.
 6. The transcript assembler joins speaker-labelled turns. The redaction service removes PII before the text is stored, published to Kafka, used for RAG, or sent outside the cluster.
-7. The router calls the classifier model to choose the domain, intent, risk level, LoRA adapter, Qdrant collection, and tenant policy. Non-actionable turns end here.
-8. Redis is checked for an approved semantic answer. When retrieval is required, the RAG service embeds the question, searches the tenant’s Qdrant collection, checks document permissions in PostgreSQL, and loads the authorized source fragments from object storage.
-9. The LLM gateway sends the prompt to the local vLLM server. Only requests that exceed configured confidence or risk thresholds are redacted again and forwarded to the approved paid-model API.
-10. The output guard validates citations, prohibited language, PII, and required compliance phrasing. The WebSocket gateway then streams the suggestion to the correct agent desktop.
-11. Each important decision is also published as a durable Kafka event, but this happens alongside the response and does not block the live suggestion.
+7. The router calls the classifier model to produce one structured route decision: intent, domain, complexity, risk level, model hint, tenant policy, and whether RAG, cache reuse, or human escalation is required. Non-actionable turns end here; critical-risk or supervisor-requested turns also create a human-escalation event.
+8. Cacheable domain queries go to the semantic and retrieval cache. It accepts an answer only when its tenant, policy version, language, expiry, risk level, customer-data scope, and citations remain valid. An approved fresh hit goes to the LLM gateway; a miss, stale entry, or unsafe result goes to RAG. Queries that cannot be cached bypass this step.
+9. The RAG service embeds the question, searches the tenant’s Qdrant collection, checks document permissions in PostgreSQL, and loads authorized source fragments from object storage. It passes the grounded context, citations, and retrieval scores to the LLM gateway.
+10. The LLM gateway sends the selected prompt to the local vLLM server. Only requests that exceed configured confidence or risk thresholds are redacted again and forwarded to the approved paid-model API.
+11. The output guard validates citations, prohibited language, PII, and required compliance phrasing. Approved suggestions stream to the correct agent desktop; blocked results return to the gateway for regeneration.
+12. The audit and telemetry publisher emits routing, retrieval, generation, and policy events to Kafka alongside the response, without blocking the live suggestion.
 
 ### Where queues and events are used
 
@@ -332,8 +349,8 @@ Kafka is the boundary between the real-time product and work that may be retried
 |---|---|---|---|
 | `call.lifecycle.v1` | Session orchestrator | Audit writer, analytics | Call started, connected, ended, or failed |
 | `transcript.final.v1` | PII redaction service | Transcript writer, analytics, post-call coordinator | Final speaker-labelled and redacted turns |
-| `copilot.decision.v1` | Router | Audit writer, evaluation pipeline | Route, confidence, model choice, cache decision, and policy version |
-| `copilot.suggestion.v1` | Output guard | Audit writer, feedback service | Validated suggestion, sources, latency, and model version |
+| `copilot.decision.v1` | Audit and telemetry publisher | Audit writer, evaluation pipeline | Route, confidence, model choice, cache decision, and policy version |
+| `copilot.suggestion.v1` | Audit and telemetry publisher | Audit writer, feedback service | Validated suggestion, sources, latency, and model version |
 | `agent.feedback.v1` | Agent UI service | Evaluation and router-training pipeline | Accepted, edited, ignored, or rejected suggestion |
 | `postcall.request.v1` | Post-call coordinator | Batch model workers | Summary, disposition, and QA work after call completion |
 | `knowledge.changed.v1` | Knowledge connectors | Chunking and indexing workers | Re-index a created, updated, or deleted source document |
