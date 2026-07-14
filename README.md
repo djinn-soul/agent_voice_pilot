@@ -92,6 +92,7 @@ sequenceDiagram
     participant K as Cache and knowledge base
     participant L as Local or paid LLM
     participant G as Safety guard
+    participant E as Supervisor or specialist
     participant U as Agent screen
 
     C->>M: Dual-channel call audio
@@ -110,13 +111,17 @@ sequenceDiagram
         R->>K: Retrieve permitted source passages
         K-->>L: Send grounded context
         L-->>R: Stream a suggested response with citations
-    else Difficult or high-risk request
-        R->>L: Use the approved escalation model
+    else Difficult request requiring model escalation
+        R->>L: Select local 14B or approved frontier escalation
         L-->>R: Stream the proposed response
     end
 
     R->>G: Validate response, citations, PII and policy
     G-->>U: Display approved suggestion or compliance alert
+    opt Human escalation required
+        R->>E: Request supervisor or specialist handoff
+        E-->>U: Show handoff status
+    end
     U-->>R: Record accepted, edited, ignored or rejected feedback
 ```
 
@@ -135,7 +140,7 @@ The architecture is model-agnostic. Each model sits behind a replaceable service
 | Sentiment and escalation risk | Fine-tuned DistilRoBERTa | Domain-specific classifier | Regional CPU or small GPU |
 | Embeddings | bge-m3 | Re-benchmarked multilingual embedding model | Triton GPU service |
 | Reranking | bge-reranker-v2-m3 | Compatible cross-encoder | Triton GPU service |
-| Routine live guidance | Llama 3.1 8B Instruct or Qwen2.5-7B with domain LoRA | Paid low-latency model when risk requires escalation | vLLM on regional L40S-class GPUs |
+| Routine live guidance | Llama 3.1 8B Instruct or Qwen2.5-7B with domain LoRA | Local 14B or approved frontier model when complexity, confidence, policy conflict, or local failure requires it | vLLM on regional L40S-class GPUs |
 | Complex RAG synthesis | Qwen2.5-14B or equivalent | Frontier reasoning model | Regional vLLM or controlled external API |
 | Post-call summary and QA | Quantized Llama 3.3 70B in batches | Frontier Batch API | Off-peak or preemptible batch GPU pool |
 
@@ -153,6 +158,12 @@ Model names are reference candidates, not fixed dependencies. Benchmark accuracy
 | Unit economics | Strong when regional GPUs remain highly utilized | Strong for pilots and small or bursty regions |
 
 The practical rule is open-first, not open-only. A new region or small tenant may start with managed APIs, then move steady volume to self-hosting once it can keep a regional fleet utilized.
+
+### Model escalation versus human escalation
+
+Model escalation selects stronger automation: the LLM gateway begins with the routine 8B pool, moves to the local 14B pool for complex synthesis, and may use an approved frontier API for low confidence, retrieval conflict, policy conflict, high risk, or local-model failure. The routing contract carries `model_hint`, `complexity`, `risk_level`, `retrieval_confidence`, `external_api_allowed`, and latency targets; the threshold values come from evaluation data rather than fixed assumptions.
+
+Human escalation is independent. The router or output guard notifies a supervisor or specialist for explicit handoff requests, fraud, legal or compliance requirements, unsafe answers, or exhausted regeneration retries. A turn can use a stronger model and request human assistance at the same time.
 
 ### Multi-tenancy and domain packs
 
@@ -219,21 +230,25 @@ flowchart LR
             ESC[Human escalation and supervisor event]:::cpu
             AUDIT[Audit and telemetry publisher]:::cpu
             SESSION --> STTG
-            STTG --> TURN
             TURN --> PII
             PII --> ROUTER
-            ROUTER -->|requires_rag=false<br/>general or procedural request| LLMGW
+            ROUTER -->|requires_rag=false<br/>Generation Request: model_hint, complexity,<br/>risk_level, latency_target, external_allowed| LLMGW
             ROUTER -->|requires_rag=true<br/>cache_allowed=true| CACHE
-            CACHE -->|approved and fresh hit| LLMGW
+            CACHE -->|approved answer hit| GUARD
+            CACHE -->|retrieval-context hit| LLMGW
             CACHE -->|miss, stale or unsafe| RAG
             ROUTER -->|requires_rag=true<br/>cache_allowed=false| RAG
-            RAG -->|grounded generation request<br/>context, citations, retrieval scores| LLMGW
+            RAG -->|grounded generation request<br/>context, citations and retrieval scores| LLMGW
             ROUTER -->|human_required=true<br/>critical risk or explicit supervisor request| ESC
-            ESC --> SESSION
+            ESC -->|update call state| SESSION
+            ESC -->|supervisor alert and handoff| WS
+            ESC -->|escalation event| KAFKA
             LLMGW --> GUARD
             GUARD -->|approved suggestion| WS
-            GUARD -->|blocked or regeneration required| LLMGW
+            GUARD -->|regenerate within retry budget<br/>retry_count, guard_failure_reason, maximum_attempts| LLMGW
+            GUARD -->|retry budget exhausted| ESC
             ROUTER --> AUDIT
+            CACHE --> AUDIT
             RAG --> AUDIT
             LLMGW --> AUDIT
             GUARD --> AUDIT
@@ -242,7 +257,8 @@ flowchart LR
         subgraph GPU[gpu-inference namespace]
             STT[STT model server<br/>Triton plus Parakeet or Whisper]:::gpu
             NLP[Classifier and embedding server<br/>Triton]:::gpu
-            LOCAL[Local LLM server<br/>vLLM plus 8B or 14B models and LoRA]:::gpu
+            LOCAL8[Routine LLM pool<br/>vLLM plus 8B models and LoRA]:::gpu
+            LOCAL14[Complex LLM pool<br/>vLLM plus 14B models and LoRA]:::gpu
             BATCH[Post-call model workers<br/>large model on batch GPU pool]:::gpu
         end
 
@@ -261,15 +277,16 @@ flowchart LR
             ANALYTICS[Analytics event sink]:::cpu
         end
 
-        STTG <-->|bidirectional gRPC audio and partial text| STT
+        STTG <-->|bidirectional gRPC<br/>audio chunks and transcript hypotheses| STT
         STTG -->|partial and final transcript| TURN
-        ROUTER -->|classification| NLP
-        CACHE <-->|approved semantic and retrieval cache| REDIS
-        RAG -->|embed and rerank| NLP
+        ROUTER <-->|intent, domain, sentiment and risk classification| NLP
+        CACHE <-->|approved answers and retrieval cache| REDIS
+        RAG <-->|embedding and reranking requests| NLP
         RAG <-->|vector search| QD
         RAG -->|document metadata and access policy| PG
         RAG -->|source content| OBJ
-        LLMGW -->|OpenAI-compatible streaming API| LOCAL
+        LLMGW <-->|routine inference: 8B| LOCAL8
+        LLMGW <-->|complex RAG synthesis: 14B| LOCAL14
         SESSION <-->|ephemeral call state| REDIS
         SESSION -->|call and transcript events| KAFKA
         PII -->|redacted transcript events| KAFKA
@@ -282,8 +299,10 @@ flowchart LR
         POST --> BATCH
         BATCH --> OBJ
         INDEX -->|upsert vectors| QD
-        INDEX --> PG
-        INDEX --> OBJ
+        INDEX -->|metadata and document versions| PG
+        INDEX -->|source artifacts| OBJ
+        INDEX -->|invalidate affected tenant and document cache| REDIS
+        INDEX -->|ingestion and version events| KAFKA
     end
 
     subgraph EXT[External and central services]
@@ -295,10 +314,11 @@ flowchart LR
     end
 
     PRE -->|TLS WebSocket or gRPC audio| GW
-    AUTH --> SESSION
+    AUTH -->|audio session| SESSION
+    AUTH -->|agent WebSocket upgrade| WS
     IDP -->|OIDC and JWKS| AUTH
     WS -->|WebSocket transcript and guidance| UI
-    LLMGW -->|redacted high-risk request only| PAID
+    LLMGW <-->|redacted approved escalation<br/>complexity, low confidence, policy risk or local failure| PAID
     POST -->|summary and disposition update| CRM
     KB -->|connector or webhook| INDEX
     CONTROL -->|GitOps config and signed model releases| K8S
@@ -334,12 +354,12 @@ The live path uses direct streaming calls because putting audio frames or genera
 4. The session orchestrator assigns a regional session, stores short-lived state in Redis, and connects the stream to the STT gateway.
 5. The STT gateway batches audio across calls and streams it to a Triton-hosted speech model. Partial transcripts can be displayed immediately; only finalized turns continue to LLM routing.
 6. The transcript assembler joins speaker-labelled turns. The redaction service removes PII before the text is stored, published to Kafka, used for RAG, or sent outside the cluster.
-7. The router calls the classifier model to produce one structured route decision: intent, domain, complexity, risk level, model hint, tenant policy, and whether RAG, cache reuse, or human escalation is required. Non-actionable turns end here; critical-risk or supervisor-requested turns also create a human-escalation event.
-8. Cacheable domain queries go to the semantic and retrieval cache. It accepts an answer only when its tenant, policy version, language, expiry, risk level, customer-data scope, and citations remain valid. An approved fresh hit goes to the LLM gateway; a miss, stale entry, or unsafe result goes to RAG. Queries that cannot be cached bypass this step.
+7. The router calls the classifier model to produce one structured route decision: intent, domain, complexity, risk level, model hint, tenant policy, and whether RAG, cache reuse, or human escalation is required. Non-actionable turns end here; critical-risk or supervisor-requested turns create an escalation event, update call state, and notify the agent desktop.
+8. Cacheable domain queries go to the semantic and retrieval cache. It accepts an answer only when its tenant, policy version, language, expiry, risk level, customer-data scope, and citations remain valid. An approved answer goes directly to the output guard, a retrieval-context hit goes to the LLM gateway, and a miss, stale entry, or unsafe result goes to RAG. Queries that cannot be cached bypass this step.
 9. The RAG service embeds the question, searches the tenant’s Qdrant collection, checks document permissions in PostgreSQL, and loads authorized source fragments from object storage. It passes the grounded context, citations, and retrieval scores to the LLM gateway.
-10. The LLM gateway sends the selected prompt to the local vLLM server. Only requests that exceed configured confidence or risk thresholds are redacted again and forwarded to the approved paid-model API.
-11. The output guard validates citations, prohibited language, PII, and required compliance phrasing. Approved suggestions stream to the correct agent desktop; blocked results return to the gateway for regeneration.
-12. The audit and telemetry publisher emits routing, retrieval, generation, and policy events to Kafka alongside the response, without blocking the live suggestion.
+10. The LLM gateway selects the routine 8B or complex 14B local pool from the generation contract. It evaluates confidence, citation coverage, policy conflict, and local failure after generation; only approved escalation cases are redacted and sent to the frontier API, whose response returns through the gateway before policy validation.
+11. The output guard validates citations, prohibited language, PII, and required compliance phrasing. Approved suggestions stream to the correct agent desktop; blocked results return to the gateway only within a bounded retry budget carrying `retry_count`, `guard_failure_reason`, and `maximum_attempts`. Exhausting that budget escalates the turn to a human.
+12. The audit and telemetry publisher emits routing, cache, retrieval, generation, and policy events to Kafka alongside the response, without blocking the live suggestion.
 
 ### Where queues and events are used
 
@@ -351,9 +371,11 @@ Kafka is the boundary between the real-time product and work that may be retried
 | `transcript.final.v1` | PII redaction service | Transcript writer, analytics, post-call coordinator | Final speaker-labelled and redacted turns |
 | `copilot.decision.v1` | Audit and telemetry publisher | Audit writer, evaluation pipeline | Route, confidence, model choice, cache decision, and policy version |
 | `copilot.suggestion.v1` | Audit and telemetry publisher | Audit writer, feedback service | Validated suggestion, sources, latency, and model version |
+| `copilot.escalation.v1` | Human escalation service | Audit writer, agent UI service | Supervisor handoff, status, and retry-budget exhaustion |
 | `agent.feedback.v1` | Agent UI service | Evaluation and router-training pipeline | Accepted, edited, ignored, or rejected suggestion |
 | `postcall.request.v1` | Post-call coordinator | Batch model workers | Summary, disposition, and QA work after call completion |
 | `knowledge.changed.v1` | Knowledge connectors | Chunking and indexing workers | Re-index a created, updated, or deleted source document |
+| `knowledge.ingested.v1` | Knowledge ingestion workers | Cache invalidation, audit writer, analytics | Completed document version and ingestion status |
 | `deadletter.*` | Kafka consumers | Operations tooling | Events that repeatedly fail validation or processing |
 
 Each consumer stores its own idempotency key in PostgreSQL or Redis. Kafka delivery is treated as at-least-once, so consumers must safely ignore duplicate `event_id` values. Raw audio is not placed on Kafka.
@@ -391,7 +413,7 @@ sequenceDiagram
     LLM-->>RAG: Streamed grounded answer
 ```
 
-PostgreSQL is the source of truth for document identity, version, ownership, access policy, and deletion state. Qdrant stores searchable vectors and filter metadata, not the authoritative document record. Object storage holds the normalized content. Deleting a document first marks it unavailable in PostgreSQL, then an idempotent event removes its vectors and blobs.
+PostgreSQL is the source of truth for document identity, version, ownership, access policy, and deletion state. Qdrant stores searchable vectors and filter metadata, not the authoritative document record. Object storage holds the normalized content. Each completed ingestion emits a version event and invalidates affected tenant and document cache entries in Redis. Deleting a document first marks it unavailable in PostgreSQL, then an idempotent event removes its vectors, blobs, and cache entries.
 
 ### API and protocol boundaries
 
