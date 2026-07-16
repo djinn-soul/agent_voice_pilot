@@ -466,33 +466,164 @@ The central layer manages tenants, model versions, evaluation, audit policy, and
 
 ## Scale and capacity
 
-The reference design evaluates a large deployment rather than claiming a measured production result.
+This section is a capacity model, not a measured production result. The original requirement can be read in two very different ways: **5,000 physical call centers** or **5,000 agents in total**. The large reference case below deliberately uses the first interpretation as a stress test. A normal pilot should use the smaller seat-based model that follows it.
 
-| Planning input | Reference value |
-|---|---:|
-| Locations | 5,000 call centers |
-| Peak calls per location | 50 |
-| Global peak | 250,000 concurrent calls |
-| Typical call length | 6 minutes |
-| Annual workload | Approximately 9.5 billion call-minutes |
-| Audio format | Independent customer and agent channels |
-| Effective STT workload | Approximately 11.4 billion channel-minutes after removing about 40% silence |
-| LLM cadence | Approximately 8–15 real-time invocations per typical call, not one per partial transcript |
-| Regionalization | Approximately 12–20 processing regions; no region should carry the global fleet |
+### Large-network stress test: 5,000 sites
 
-These figures are sizing inputs. If the real requirement is 5,000 agents rather than 5,000 physical call centers, both the topology and budget change substantially.
+| Planning input | Reference value | How it is derived |
+|---|---:|---|
+| Physical locations | 5,000 call centers | Requirement assumption, not a measured count |
+| Planning calendar | 231 open days/year | `365 - (52 weeks × 2 weekly days off) - 30 additional holiday/closure days` |
+| Open hours | 15 hours/site/day | Midpoint of a 14–16-hour operating window, normally covered by staggered shifts |
+| Average active calls while open | 7.5/site in the base case | 15% of the 50-call peak; also evaluate 5 and 10 average calls/site |
+| Local peak capacity | 50 simultaneous calls/site | A site-level ceiling, not an assumption that all sites peak together |
+| Base global peak | 62,500 simultaneous calls | `5,000 × 50 × 25% peak coincidence`; validate across time zones from ACD data |
+| Stress-test global peak | 250,000 simultaneous calls | 100% coincidence: every site reaches its local peak at the same moment |
+| Average connected-call duration | 6 minutes | Audio connection time, including on-call hold; after-call work is excluded |
+| Annual call-minutes | Approximately 7.8 billion in the base case | `5,000 × 231 × 15 × 60 × 7.5`; equivalent to about 1.30B six-minute calls |
+| Year-round average concurrency | Approximately 14,800 calls | `7.8B minutes ÷ 525,600 minutes/year` |
+| Base global peak-to-average ratio | Approximately 4.2× | `62,500 base peak ÷ 14,800 year-round average`; the stress ceiling is about 16.9× |
+| Raw STT input | Approximately 15.6 billion channel-minutes/year | Two independently transcribed channels per call |
+| Combined speech time | 4.5 minutes/call | Customer plus agent speech occupies an assumed 75% of the six-minute connection; measure cross-talk and hold time |
+| Speech-bearing STT inference | Approximately 5.85 billion channel-minutes/year | `7.8B call-minutes × 75% combined speech`; silence on the two channels is not counted twice |
+| English transcript size | Approximately 585 words or 760 tokens/call | `4.5 speech-minutes × 130 words/minute × 1.3 tokens/word` |
+| Real-time LLM requests | Approximately 6.24B/year in the base case | `7.8B call-minutes × 4 finalized utterances/minute × 20% generation rate` |
+| Processing regions | 12–20 | Base average of about 3,100–5,200 peak calls/region; stress ceiling of 12,500–20,800 before skew |
+
+The 7.8B-minute figure is a middle scenario, not a target that the design must reach. Average utilization is the most uncertain input:
+
+| Utilization scenario | Average active calls/site | Share of 50-call site peak | Annual call-minutes | Six-minute calls/year |
+|---|---:|---:|---:|---:|
+| Low | 5 | 10% | Approximately 5.20B | Approximately 866M |
+| **Base** | **7.5** | **15%** | **Approximately 7.80B** | **Approximately 1.30B** |
+| High | 10 | 20% | Approximately 10.40B | Approximately 1.73B |
+
+If real ACD data shows only two or three average simultaneous calls per site, the annual workload should be reduced accordingly. Steady compute and API consumption should follow measured average traffic. Do not procure for the 250,000-call ceiling unless traffic data shows that site peaks really coincide or the business explicitly requires that disaster-capacity guarantee.
+
+The distinction between raw and speech-bearing audio matters. Two six-minute channels create 12 channel-minutes of transport, but normally the customer and agent take turns speaking. Assuming 60% speech on **each** channel would incorrectly imply 7.2 minutes of speech inside a six-minute call. This model instead assumes 4.5 combined speech-minutes and requires the real ratio to be measured from audio samples.
+
+A managed STT provider may bill the six-minute media duration once for a stereo/multi-channel request, twice for two independent streams, or according to another product-specific rule. Voice activity detection lowers the provider bill only when silence can be removed before its billing boundary. The pricing model must therefore show both the provider's channel policy and the architecture's stream format.
+
+### What one six-minute call produces
+
+| Item | Baseline per call | Planning note |
+|---|---:|---|
+| Connected audio | 6 call-minutes | Use ACD connected duration, not handle time with after-call work |
+| Raw dual-channel transport | 12 channel-minutes | Customer and agent channels stay separate |
+| Speech sent to self-hosted STT inference | Approximately 4.5 channel-minutes | 75% combined speech occupancy after voice activity detection |
+| Transcript | Approximately 585 words / 760 tokens | English at 130 words/minute and 1.3 tokens/word; measure each language separately |
+| Plain transcript storage | Approximately 4–8 KB | Before timestamps, confidence, speaker labels, JSON, indexes, replicas, and audit metadata |
+| Finalized conversational turns | Approximately 24 | `6 minutes × 4 utterances/minute`; used by the lightweight router |
+| Live LLM generations | Approximately 4.8 | `24 utterances × 20%`; use 10%–40% as a sensitivity range |
+| Average live-LLM input | 1,200 tokens/generation | Includes system policy, compact call state, user turn, and optional retrieved evidence |
+| Average live-LLM output | 100 tokens/generation | Capacity envelope for a short agent suggestion; measure the real output distribution |
+| Total live-LLM tokens | Approximately 5,760 input plus 480 output | `4.8 generations × 1,200 input + 100 output`; repeated prefixes still consume serving capacity |
+| Post-call job | Approximately 1,200 input plus 400 output tokens | Transcript/state in; summary, disposition, and quality fields out |
+
+These token values are deliberately explicit assumptions. Capture actual tokenizer counts at the LLM gateway and report p50, p90, and p99 by language, domain, cache status, and RAG usage. Averages alone are insufficient for latency and memory planning.
+
+Call duration changes the number of calls even when annual call-minutes stay fixed. With four utterances per call-minute and a 20% generation rate, LLM request rate follows active call-minutes rather than calls completed:
+
+| Average call duration | Calls from 7.8B call-minutes | Peak completed calls/s at 62,500 base concurrency | Base LLM requests/s |
+|---:|---:|---:|---:|
+| 4 minutes | Approximately 1.95B/year | Approximately 260 | Approximately 833 |
+| **6 minutes (baseline)** | **Approximately 1.30B/year** | **Approximately 174** | **Approximately 833** |
+| 10 minutes | Approximately 780M/year | Approximately 104 | Approximately 833 |
+
+Multiply the peak-rate columns by four for the 250,000-call stress ceiling.
+
+Longer calls also contain more text. Measure utterances and generation routing per call-minute rather than holding a fixed number of generations per call.
+
+The calendar needs one important interpretation. `52 weeks × 2 days off = 104 days`, but those may be **agent roster days off**, not days when the call center closes. Likewise, a one-month holiday period contains roughly eight weekend days; if it already includes weekends, subtract about 22 additional weekdays rather than another 30 days. That produces 239 open days instead of the conservative 231-day baseline.
+
+At the base utilization of 7.5 active calls/site, 231 open days produce approximately 7.28B, 7.80B, and 8.32B call-minutes for 14-, 15-, and 16-hour operating days. A 15-hour site does not require a 15-hour agent shift: use overlapping eight-hour shifts and calculate staffing separately. Centers that remain open on weekends or national holidays must use their actual site calendar.
+
+### More typical rollout example: 5,000 agents total
+
+For comparison, assume 5,000 named full-time agents. Start with 365 calendar days, subtract 104 weekly days off and a combined 30 additional days for public holidays, annual leave, sickness, training, and other shrinkage. That leaves an illustrative 231 productive days per agent. Assume an eight-hour agent shift and 70% connected-call occupancy; breaks and after-call work are outside connected audio. Do not give an individual agent a 14–16-hour shift merely because the site is open that long.
+
+| Planning input | Example value | How it is derived |
+|---|---:|---|
+| Productive days per agent | 231/year | `365 - 104 weekly days off - 30 combined holiday/leave/shrinkage days` |
+| Annual call-minutes | Approximately 388.1 million | `5,000 × 231 × 8 × 60 × 70%` |
+| Six-minute calls | Approximately 64.7 million/year | `388.1M ÷ 6` |
+| Peak simultaneous calls | Measure; provision an example 4,000 | 3,500 active calls plus about 15% operational headroom |
+| Raw dual-channel STT transport | Approximately 776.2 million channel-minutes/year | `388.1M × 2 channels` |
+| Speech-bearing STT inference | Approximately 291.1 million channel-minutes/year | `388.1M × 75% combined speech` |
+| Transcript text | Approximately 49.2 billion English tokens/year | `64.7M calls × 760 transcript tokens` |
+| Real-time LLM requests | Approximately 310M/year | `388.1M call-minutes × 4 utterances/minute × 20%` |
+| Live-LLM token volume | Approximately 373B input and 31B output | Requests multiplied by 1,200 input and 100 output tokens |
+
+This seat-based example is about **20× smaller by annual call-minutes** and about **62× smaller by provisioned peak concurrency** than the 5,000-site base case. Costs do not fall perfectly in proportion because every active region still needs a minimum highly available service footprint. Holiday, leave, and sickness allowances affect named-agent capacity; they should not be subtracted again if the input already contains actual logged-in hours.
 
 ### Peak fleet planning
 
-The following figures include approximately 30% headroom and must be replaced with results from the selected models, audio formats, batching policy, and hardware.
+Fleet size must come from a benchmark of the exact model, language mix, audio chunking, prompt length, output limit, quantization, and latency objective. The planning baseline below uses 25% peak coincidence, or 62,500 simultaneous calls globally, plus 30% failover/headroom. It is not a hardware quote.
 
-| Component | Planning throughput | Peak units |
-|---|---:|---:|
-| Streaming STT on L4-class GPU | Approximately 300 audio streams per GPU; two channels per call | Approximately 2,150 GPUs |
-| Fast NLP/router | Approximately 2,000 utterances/s per 16-core node | Approximately 120 CPU nodes |
-| 8B vLLM on L40S-class GPU | Approximately 60 concurrent generations; LLM active for a small fraction of each call | Approximately 220 GPUs |
-| Embedding and reranking | Shared bge-m3 and reranker fleet | Approximately 40 GPUs plus Qdrant CPU nodes |
-| Post-call 70B processing | Asynchronous and checkpointable | Reuse off-peak capacity plus preemptible nodes |
+| Component | Explicit planning assumption | Illustrative peak requirement |
+|---|---|---:|
+| Streaming STT GPU inference | 46,875 speech-bearing channel equivalents at base peak; benchmark 150–300 real-time channel equivalents per GPU | Approximately 203–406 GPUs |
+| STT session and media handling | 125,000 open channel streams at base peak; silence still consumes connections and CPU | Size CPU nodes from connection, codec, and network tests |
+| Fast NLP/router | Approximately 3,500–6,900 finalized turns/s and 2,000 turns/s per 16-core node | Approximately 2–5 compute nodes mathematically; deploy at least 24–40 for two nodes in each of 12–20 regions |
+| Live 8B LLM decode | Approximately 833 requests/s at base peak and 100 output tokens/request; benchmark 1,500 useful output tokens/s/GPU at the latency target | At least 73 decode GPUs after 30% headroom |
+| Embedding and reranking | Depends on the percentage of turns that miss cache and require RAG | Benchmark first; a two-GPU regional floor is 24–40 GPUs across 12–20 regions |
+| Post-call large-model work | Annual average is about 41 completed calls/s; base instantaneous peak is about 174 calls/s and the stress ceiling is about 694 calls/s | Queue the work and size to its completion SLA, not live-call peak |
+
+The GPU formulas are:
+
+```text
+STT GPUs
+  = global peak calls × combined speech share × headroom
+    ÷ benchmarked real-time speech streams per GPU
+
+decode GPUs
+  = requests/second × output tokens/request
+    ÷ benchmarked useful output tokens/second/GPU
+
+prefill GPUs
+  = requests/second × uncached input tokens/request
+    ÷ benchmarked useful input tokens/second/GPU
+
+final live-LLM fleet
+  = ceiling(max(decode, prefill, latency/concurrency, KV-memory, regional floor)
+    × headroom)
+```
+
+Concurrency alone is not a sufficient sizing unit because it hides prompt length, output length, batching, time to first token, and inter-token latency. Token throughput makes the workload explicit, but the benchmark must report **useful throughput while meeting the p95 latency target**, not the highest offline batch throughput.
+
+#### Worked LLM capacity example
+
+```text
+50,000 concurrent calls
+× 4 finalized utterances/call-minute
+× 20% requiring generation
+÷ 60 seconds
+= approximately 667 LLM requests/second
+
+667 requests/second × 100 output tokens
+= approximately 66,700 output tokens/second
+
+66,700 ÷ 1,500 useful output tokens/second/GPU
+= approximately 45 GPUs before headroom
+
+45 × 1.30
+= approximately 59 GPUs
+```
+
+For this project's 62,500-call base peak, the same calculation is `62,500 × 4 × 20% ÷ 60 ≈ 833 requests/s`, then `833 × 100 ÷ 1,500 × 1.3 ≈ 73 decode GPUs`.
+
+Decode is only one constraint. At 1,200 input tokens/request, the same base traffic creates approximately **1 million input tokens/second** before cached-prefix discounts. Benchmark prefill throughput separately, check KV-cache memory at the required concurrency, and use the largest resulting fleet. Regional minimums and traffic imbalance can increase the deployable count further.
+
+| Coincidence of site peaks | Global peak calls | STT GPUs at 150–300 streams/GPU | Decode GPUs at 100 output tokens/request |
+|---:|---:|---:|---:|
+| 10% | 25,000 | Approximately 81–163 | Approximately 29 |
+| **25% planning base** | **62,500** | **Approximately 203–406** | **Approximately 73** |
+| 50% | 125,000 | Approximately 406–813 | Approximately 145 |
+| 100% stress ceiling | 250,000 | Approximately 813–1,625 | Approximately 289 |
+
+The counts scale almost linearly with the coincidence factor. They should be replaced by the maximum concurrent calls observed across all regions, not the sum of every site's independent local maximum.
+
+Before procurement, replay at least one week of anonymized traffic through the chosen models and record sustained throughput, p95 latency, GPU memory, failure rate, and output quality. NVIDIA's [Triton Performance Analyzer](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/perf_analyzer/docs/README.html) or an equivalent load generator can measure the latency/throughput curve; spreadsheet estimates cannot replace that test.
 
 ### Latency and availability targets
 
@@ -526,33 +657,81 @@ The highest-ROI, lowest-risk changes are prefix caching, speculative decoding, a
 
 ## Economics
 
-At the reference scale, the architecture is intended to reduce repeated per-minute and per-token API charges by keeping steady workloads on shared infrastructure.
+At this scale, a credible budget starts with billable units rather than one large total. Provider discounts, languages, data residency, retention, and support terms can move the result by hundreds of millions of dollars.
 
-| Operating approach | Planning estimate per year | Approximate cost per call-minute |
+### Managed-API calculation
+
+| Cost driver | Annual billable volume in the stress test | Calculation |
+|---|---:|---|
+| Streaming STT | 5.85B speech-bearing channel-minutes after VAD; 7.8B media-minutes if stereo duration is billed once; as much as 15.6B if two full streams are billed | `provider-billable minutes × contracted STT price/minute` |
+| Live-LLM input | Approximately 7.48T tokens/year | `6.24B requests × 1,200 input tokens`; split cached and uncached tokens |
+| Live-LLM output | Approximately 624B tokens/year | `6.24B requests × 100 output tokens` |
+| Post-call LLM | Approximately 1.56T input and 520B output tokens/year | `1.30B calls × 1,200 input + 400 output tokens`; batch discounts may apply |
+| Platform services | Media gateways, databases, network, observability, support, and operations | Add separately; these costs remain even when inference is managed |
+
+As a public-price sanity check, Google Cloud currently lists Speech-to-Text V2 standard recognition by processed audio minute, with volume tiers on its [pricing page](https://cloud.google.com/speech-to-text/pricing). Model APIs such as OpenAI publish separate input, cached-input, and output token rates on their [API pricing page](https://openai.com/api/pricing/). These public pages are examples, not vendor selections or enterprise quotes.
+
+An understandable managed estimate therefore looks like this:
+
+```text
+annual managed cost
+  = provider-billable STT minutes × quoted STT rate
+  + LLM requests × average tokens per request × quoted token rates
+  + platform, network, storage, support, and operations
+```
+
+Do not retain the previous **$330M–$475M** range unless vendor quotes and measured token traces reproduce it. That range was built around the earlier forced 9.5B-minute workload. The new 5.2B–10.4B utilization scenarios must be priced independently rather than scaled from that unsupported total.
+
+### Worked cost for one six-minute call
+
+The following example shows the method, not a purchasing recommendation. It uses an illustrative high-volume STT rate of **$0.004 per billable audio minute**, an LLM input rate of **$1 per million tokens**, and an output rate of **$6 per million tokens**. Those example rates are compatible with publicly listed low-cost tiers as of 2026-07-16, but availability, quotas, model quality, and enterprise terms must be checked.
+
+| Per-call item | Calculation | Example cost |
 |---|---:|---:|
-| Predominantly managed STT and LLM APIs | $330M–$475M | $0.035–$0.050 |
-| Regional self-hosting with controlled API escalation | $57M–$86M | $0.006–$0.009 |
+| STT when six-minute stereo duration is billed once | `6 × $0.004` | $0.0240 |
+| STT when two full six-minute streams are billed | `12 × $0.004` | $0.0480 |
+| 10% generation rate | `2.4 generations: 2,880 input + 240 output tokens` | $0.0043 |
+| **20% base generation rate** | `4.8 generations: 5,760 input + 480 output tokens` | **$0.0086** |
+| 40% generation rate | `9.6 generations: 11,520 input + 960 output tokens` | $0.0173 |
+| One post-call job | `1,200 input × $1/M + 400 output × $6/M` | $0.0036 |
+
+This produces the following inference-only boundary:
+
+| Provider billing method | Cost per six-minute call | Cost per connected call-minute | Annual cost at 1.30B base-case calls |
+|---|---:|---:|---:|
+| STT duration billed once + 10%–40% generated utterances + post-call job | Approximately $0.032–$0.045 | Approximately $0.0053–$0.0075 | Approximately $41M–$58M |
+| Two STT streams billed separately + 10%–40% generated utterances + post-call job | Approximately $0.056–$0.069 | Approximately $0.0093–$0.0115 | Approximately $73M–$90M |
+
+At the 20% base generation rate, the corresponding midpoints are approximately **$0.036 per call / $47M per year** when STT duration is billed once and **$0.060 per call / $78M per year** when two streams are billed separately.
+
+These totals exclude media gateways, databases, networking, storage, observability, support, taxes, and operations. They also assume all input tokens receive the same rate. In production, split cached and uncached prompt tokens, paid escalation models, and batch post-call work into separate rows. For a different call duration, replace 6 or 12 STT minutes and derive transcript size from measured speech time; do not scale LLM calls blindly unless actionable-turn frequency also scales with duration.
 
 ### Fully loaded hybrid estimate
 
-| Cost category | Planning range per year |
-|---|---:|
-| STT GPU fleet | $8M–$12M |
-| Live copilot LLM GPU fleet | $1.6M–$2.4M |
-| RAG embedding and reranking GPUs | $0.3M–$0.5M |
-| Post-call large-model batch compute | $1.5M–$3M |
-| CPU media, routing, API, and WebSocket services | $4M–$6M |
-| PostgreSQL, Qdrant, Redis, Kafka, and retained artifacts | $2M–$3M |
-| Regional and inter-region network traffic | $3M–$5M |
-| Paid STT/LLM overflow and difficult cases | $6M–$12M |
-| Regulated-site edge equipment | $3M–$5M |
-| Observability and control-plane services | $2M–$3M |
-| Operations and SRE team | $3M–$5M |
-| Fine-tuning and evaluation | $1M–$2M |
+The following figures remain order-of-magnitude placeholders for the large-network stress test. They are useful for identifying cost categories, but each infrastructure row needs a stated purchase model: owned hardware amortization, reserved cloud capacity, or on-demand cloud pricing.
 
-The line items are rounded planning ranges and some infrastructure allocation boundaries overlap. Use the consolidated **$57M–$86M** total rather than independently adding every rounded row.
+| Cost category | Planning range per year | What must be validated |
+|---|---:|---|
+| STT GPU fleet | $1.5M–$4M | 203–406 base GPUs at an illustrative all-in $0.84–$1.12/GPU-hour; benchmark and quote the accelerator plus host VM |
+| Live copilot LLM GPU fleet | $1.2M–$3.5M | 73 decode-GPU floor; upper placeholder allows roughly 2× for prefill, KV memory, regional imbalance, and redundancy pending benchmarks |
+| RAG embedding and reranking GPUs | $0.3M–$1M | Cache-miss/RAG rate, regional minimum, embedding batch size, and reranker latency |
+| Post-call large-model batch compute | $2M–$6M | 1.30B base-case jobs, batch model, tokens/job, completion SLA, and interruptible pricing |
+| CPU media, routing, API, and WebSocket services | $4M–$8M | 500,000 open channel streams, codec cost, regional redundancy, and connection tests |
+| PostgreSQL, Qdrant, Redis, Kafka, and retained artifacts | $2M–$5M | Events/call, vector count, retention, replicas, backup, and storage tier |
+| Regional and inter-region network traffic | $3M–$8M | Audio bitrate, egress direction, cross-zone replication, and carrier/private-link fees |
+| Paid STT/LLM overflow and difficult cases | $6M–$20M | Escalation percentage multiplied by the managed-unit formulas above |
+| Regulated-site edge equipment | $3M–$8M | Number of regulated sites, redundancy, depreciation period, support, and spares |
+| Observability and control-plane services | $2M–$5M | Metric/log/cardinality volume, retention, traces, and vendor or self-hosted operation |
+| Operations and SRE team | $3M–$8M | Loaded compensation by country, on-call coverage, security, data, and ML operations |
+| Fine-tuning and evaluation | $1M–$4M | Dataset labeling, judge/evaluation runs, training cadence, and specialist staff |
+| **Subtotal of the rows above** | **$29M–$80.5M** | Arithmetic total before contingency; the width reflects unquoted inputs |
+| **Planning total with 20% contingency** | **$34.8M–$96.6M** | Approximately **$0.0045–$0.0124 per call-minute** at 7.8B base-case minutes |
 
-The hybrid estimate includes more than GPUs. It accounts for compute, network traffic, regional data services, external-model usage, regulated-site equipment, observability, model evaluation, and the team required to operate the platform.
+The GPU hourly rates are transparent placeholders derived from the annual row totals, not negotiated quotes. Cloud bills also include the host VM, CPU, memory, disks, network, reservations, and regional pricing. Google Cloud's [Compute Engine pricing documentation](https://cloud.google.com/products/compute/pricing) confirms that these resources and commitment discounts are priced separately. For procurement, replace the placeholder hourly rates with dated quotes for every processing region.
+
+The prior **$57M–$86M** total did not reconcile with its own line items or expose enough inputs. The revised range uses the 25% peak-coincidence baseline and keeps the 100% case as a stress ceiling. It is mathematically consistent, but it is still not a quote. If categories overlap, remove the overlap from the affected rows instead of instructing readers not to add them.
+
+The hybrid estimate includes more than GPUs: compute, network traffic, regional data services, external-model usage, regulated-site equipment, observability, evaluation, and the team required to operate the platform. It excludes agent salaries, contact-center software licenses, telephony charges, taxes, financing, and the cost of replacing existing desktop integrations unless those are added explicitly.
 
 The most valuable cost controls are architectural:
 
@@ -565,13 +744,13 @@ The most valuable cost controls are architectural:
 - Autoscale regional pools around predictable call volume.
 - Route only a measured minority of requests to paid models.
 
-All numbers are planning estimates and must be recalculated using current provider quotes, observed traffic, retention policies, languages, and benchmarked model throughput.
+All numbers are planning estimates in US dollars and must be recalculated using dated provider quotes, observed traffic, retention policies, language mix, staffing location, hardware purchase model, and benchmarked model throughput. Record the date, region, discounts, and included support level beside every quote so the estimate can be reproduced later.
 
 ### Sensitivity and build-versus-buy
 
 | Scenario | Architectural effect |
 |---|---|
-| 5,000 seats rather than 5,000 sites | Reduce the estimate by roughly 100× and begin with a small shared pod or managed APIs |
+| 5,000 seats rather than 5,000 sites | In the examples above, annual minutes fall about 20× and provisioned peak concurrency about 62×; begin with managed APIs or a small shared regional pool |
 | Heavy long-tail multilingual traffic | Increase Whisper-class or paid-STT capacity; STT cost may rise 20–40% |
 | On-premises processing required at every site | Edge hardware and fleet operations become dominant costs |
 | Regional volume too small to keep GPUs utilized | Use managed APIs until sustained traffic justifies self-hosting |
